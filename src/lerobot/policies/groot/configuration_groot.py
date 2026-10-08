@@ -178,8 +178,8 @@ class GrootConfig(PreTrainedConfig):
     def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
         """Return scheduler configuration."""
         return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=int(10000 * self.warmup_ratio),  # 5% warmup by default
-            num_decay_steps=10000,  # Adjust based on training steps
+            num_warmup_steps=int(self.max_steps * self.warmup_ratio),
+            num_decay_steps=self.max_steps,
             peak_lr=self.optimizer_lr,
             decay_lr=self.optimizer_lr * 0.1,
         )

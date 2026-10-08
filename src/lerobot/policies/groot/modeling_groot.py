@@ -33,6 +33,7 @@ Notes:
 """
 
 import builtins
+import json
 import os
 from collections import deque
 from pathlib import Path
@@ -50,6 +51,79 @@ from .configuration_groot import GrootConfig
 from .groot_n1 import GR00TN15
 
 T = TypeVar("T", bound="GrootPolicy")
+
+
+def _replace_parameter(
+    module, name: str, value: Tensor, *, requires_grad: bool
+) -> None:
+    """Replace a shaped parameter without losing its trainability setting."""
+    setattr(module, name, torch.nn.Parameter(value, requires_grad=requires_grad))
+
+
+def adapt_groot_io_dimensions(
+    model: GR00TN15, max_state_dim: int, max_action_dim: int
+) -> None:
+    """Expand a loaded GR00T action head while preserving every pretrained parameter.
+
+    GR00T-N1.5 is released with a 64D state encoder and 32D action encoder/decoder. Wider robot
+    vectors must be adapted after the base checkpoint has loaded; constructing a wider head first
+    would cause shape-mismatch loading. New channels start at zero, so the original pretrained
+    behavior is unchanged until fine-tuning supplies gradients for them.
+    """
+    head = model.action_head
+    old_state_dim = int(head.state_encoder.layer1.W.shape[1])
+    old_action_dim = int(head.action_encoder.W1.W.shape[1])
+    if max_state_dim < old_state_dim or max_action_dim < old_action_dim:
+        raise ValueError(
+            "GR00T I/O adaptation only supports expansion: "
+            f"base state/action={old_state_dim}/{old_action_dim}, "
+            f"requested={max_state_dim}/{max_action_dim}"
+        )
+
+    if max_state_dim > old_state_dim:
+        layer = head.state_encoder.layer1
+        trainable = layer.W.requires_grad
+        expanded = layer.W.detach().new_zeros(
+            layer.W.shape[0], max_state_dim, layer.W.shape[2]
+        )
+        expanded[:, :old_state_dim, :] = layer.W.detach()
+        _replace_parameter(layer, "W", expanded, requires_grad=trainable)
+
+    if max_action_dim > old_action_dim:
+        encoder = head.action_encoder.W1
+        trainable = encoder.W.requires_grad
+        expanded = encoder.W.detach().new_zeros(
+            encoder.W.shape[0], max_action_dim, encoder.W.shape[2]
+        )
+        expanded[:, :old_action_dim, :] = encoder.W.detach()
+        _replace_parameter(encoder, "W", expanded, requires_grad=trainable)
+
+        decoder = head.action_decoder.layer2
+        weight_trainable = decoder.W.requires_grad
+        bias_trainable = decoder.b.requires_grad
+        expanded_w = decoder.W.detach().new_zeros(
+            decoder.W.shape[0], decoder.W.shape[1], max_action_dim
+        )
+        expanded_b = decoder.b.detach().new_zeros(decoder.b.shape[0], max_action_dim)
+        expanded_w[:, :, :old_action_dim] = decoder.W.detach()
+        expanded_b[:, :old_action_dim] = decoder.b.detach()
+        _replace_parameter(decoder, "W", expanded_w, requires_grad=weight_trainable)
+        _replace_parameter(decoder, "b", expanded_b, requires_grad=bias_trainable)
+
+    head.action_dim = max_action_dim
+    head.config.max_state_dim = max_state_dim
+    head.config.action_dim = max_action_dim
+    model.action_dim = max_action_dim
+    model.config.action_dim = max_action_dim
+    model.config.action_head_cfg["max_state_dim"] = max_state_dim
+    model.config.action_head_cfg["action_dim"] = max_action_dim
+
+    if max_state_dim != old_state_dim or max_action_dim != old_action_dim:
+        print(
+            "[GROOT] expanded pretrained action head "
+            f"state {old_state_dim}->{max_state_dim}, action {old_action_dim}->{max_action_dim}; "
+            "new channels are zero-initialized"
+        )
 
 
 class GrootPolicy(PreTrainedPolicy):
@@ -89,8 +163,13 @@ class GrootPolicy(PreTrainedPolicy):
             tune_projector=self.config.tune_projector,
             tune_diffusion_model=self.config.tune_diffusion_model,
         )
+        adapt_groot_io_dimensions(
+            model, self.config.max_state_dim, self.config.max_action_dim
+        )
 
-        model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
+        model.compute_dtype = (
+            "bfloat16" if self.config.use_bf16 else model.compute_dtype
+        )
         model.config.compute_dtype = model.compute_dtype
 
         return model
@@ -152,13 +231,21 @@ class GrootPolicy(PreTrainedPolicy):
         # Check if this is a fine-tuned LeRobot checkpoint (has model.safetensors)
         try:
             if os.path.isdir(model_id):
-                is_finetuned_checkpoint = os.path.exists(os.path.join(model_id, SAFETENSORS_SINGLE_FILE))
+                config_file = os.path.join(model_id, "config.json")
+                if os.path.exists(config_file) and os.path.exists(
+                    os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
+                ):
+                    with open(config_file) as handle:
+                        is_finetuned_checkpoint = (
+                            json.load(handle).get("type") == "groot"
+                        )
             else:
-                # Try to download the safetensors file to check if it exists
+                # Raw NVIDIA base repos also have model.safetensors. A LeRobot checkpoint is
+                # identified by its policy config, not merely by the presence of that filename.
                 try:
-                    hf_hub_download(
+                    config_file = hf_hub_download(
                         repo_id=model_id,
-                        filename=SAFETENSORS_SINGLE_FILE,
+                        filename="config.json",
                         revision=revision,
                         cache_dir=cache_dir,
                         force_download=False,  # Just check, don't force download
@@ -166,7 +253,21 @@ class GrootPolicy(PreTrainedPolicy):
                         token=token,
                         local_files_only=local_files_only,
                     )
-                    is_finetuned_checkpoint = True
+                    with open(config_file) as handle:
+                        is_finetuned_checkpoint = (
+                            json.load(handle).get("type") == "groot"
+                        )
+                    if is_finetuned_checkpoint:
+                        hf_hub_download(
+                            repo_id=model_id,
+                            filename=SAFETENSORS_SINGLE_FILE,
+                            revision=revision,
+                            cache_dir=cache_dir,
+                            force_download=False,
+                            proxies=proxies,
+                            token=token,
+                            local_files_only=local_files_only,
+                        )
                 except HfHubHTTPError:
                     is_finetuned_checkpoint = False
         except Exception:
@@ -235,7 +336,8 @@ class GrootPolicy(PreTrainedPolicy):
         groot_inputs = {
             k: v
             for k, v in batch.items()
-            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
+            if (k in allowed_base or k.startswith("eagle_"))
+            and not (k.startswith("next.") or k == "info")
         }
 
         # Get device from model parameters
@@ -243,7 +345,9 @@ class GrootPolicy(PreTrainedPolicy):
 
         # Run GR00T forward under bf16 autocast when enabled to reduce activation memory
         # Rationale: Matches original GR00T finetuning (bf16 compute, fp32 params) and avoids fp32 upcasts.
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16
+        ):
             outputs = self._groot_model.forward(groot_inputs)
 
         # Isaac-GR00T returns a BatchFeature; loss key is typically 'loss'
@@ -268,14 +372,17 @@ class GrootPolicy(PreTrainedPolicy):
         groot_inputs = {
             k: v
             for k, v in batch.items()
-            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
+            if (k in allowed_base or k.startswith("eagle_"))
+            and not (k.startswith("next.") or k == "info")
         }
 
         # Get device from model parameters
         device = next(self.parameters()).device
 
         # Use bf16 autocast for inference to keep memory low and match backbone dtype
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16
+        ):
             outputs = self._groot_model.get_action(groot_inputs)
 
         actions = outputs.get("action_pred")
@@ -291,7 +398,7 @@ class GrootPolicy(PreTrainedPolicy):
         self.eval()
 
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)
+            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 
@@ -321,8 +428,12 @@ class GrootPolicy(PreTrainedPolicy):
         except Exception as e:
             if "undefined symbol" in str(e):
                 print(f"[GROOT] Flash Attention compatibility issue detected: {e}")
-                print("[GROOT] This is likely due to PyTorch/Flash Attention version mismatch")
-                print("[GROOT] Consider reinstalling Flash Attention with compatible version:")
+                print(
+                    "[GROOT] This is likely due to PyTorch/Flash Attention version mismatch"
+                )
+                print(
+                    "[GROOT] Consider reinstalling Flash Attention with compatible version:"
+                )
                 print("  pip uninstall flash-attn")
                 print("  pip install --no-build-isolation flash-attn==2.6.3")
                 print("[GROOT] Continuing with fallback attention mechanism")
