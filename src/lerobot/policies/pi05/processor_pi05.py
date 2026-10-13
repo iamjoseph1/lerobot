@@ -64,6 +64,11 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
         if state is None:
             raise ValueError("State is required for PI05")
+        if state.shape[-1] > self.max_state_dim:
+            raise ValueError(
+                f"PI05 state has {state.shape[-1]} dimensions, "
+                f"exceeding max_state_dim={self.max_state_dim}"
+            )
         tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")

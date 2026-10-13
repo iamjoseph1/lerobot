@@ -302,6 +302,24 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+        if isinstance(policy_cfg, PI05Config):
+            # The base checkpoint's processor was saved for a 32D state and a
+            # 200-token prompt. Use the current policy settings when fine-tuning
+            # or loading a checkpoint with a wider tokenized state.
+            preprocessor_overrides = dict(kwargs.get("preprocessor_overrides", {}))
+            for step_name, settings in (
+                (
+                    "pi05_prepare_state_tokenizer_processor_step",
+                    {"max_state_dim": policy_cfg.max_state_dim},
+                ),
+                ("tokenizer_processor", {"max_length": policy_cfg.tokenizer_max_length}),
+            ):
+                preprocessor_overrides[step_name] = {
+                    **settings,
+                    **preprocessor_overrides.get(step_name, {}),
+                }
+            kwargs["preprocessor_overrides"] = preprocessor_overrides
+
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
             config_filename=kwargs.get(

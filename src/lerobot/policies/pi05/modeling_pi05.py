@@ -66,6 +66,54 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def _expand_pretrained_action_projections(
+    state_dict: dict[str, Tensor], target_state_dict: dict[str, Tensor]
+) -> None:
+    """Keep the pretrained 32D action channels and zero-initialize added channels.
+
+    PI0.5 represents state as language tokens, so only these action projections
+    depend on the padded action dimension. Exact-shape checkpoints are unchanged.
+    """
+    action_axes = {
+        "model.action_in_proj.weight": 1,
+        "model.action_out_proj.weight": 0,
+        "model.action_out_proj.bias": 0,
+    }
+    for key, action_axis in action_axes.items():
+        if key not in state_dict or key not in target_state_dict:
+            continue  # strict load_state_dict will report a missing key.
+
+        source = state_dict[key]
+        target = target_state_dict[key]
+        if source.shape == target.shape:
+            continue
+        if (
+            source.ndim != target.ndim
+            or any(
+                source.shape[axis] != target.shape[axis]
+                for axis in range(source.ndim)
+                if axis != action_axis
+            )
+            or source.shape[action_axis] >= target.shape[action_axis]
+        ):
+            raise ValueError(
+                f"Cannot expand pretrained PI0.5 action projection {key}: "
+                f"checkpoint {tuple(source.shape)}, policy {tuple(target.shape)}"
+            )
+
+        expanded = source.new_zeros(target.shape)
+        pretrained_slice = [slice(None)] * source.ndim
+        pretrained_slice[action_axis] = slice(0, source.shape[action_axis])
+        expanded[tuple(pretrained_slice)] = source
+        state_dict[key] = expanded
+        logging.info(
+            "Expanded pretrained PI0.5 %s from %s to %s; added action channels start at zero",
+            key,
+            tuple(source.shape),
+            tuple(target.shape),
+        )
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -983,78 +1031,40 @@ class PI05Policy(PreTrainedPolicy):
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
 
-        # Load state dict (expects keys with "model." prefix)
-        try:
-            print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
+        # Load state dict (expects keys with "model." prefix). Loading failures
+        # must stop training; otherwise a new model could be trained by accident.
+        from safetensors.torch import load_file
+        from transformers.utils import cached_file
 
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                from safetensors.torch import load_file
+        resolved_file = cached_file(
+            pretrained_name_or_path,
+            "model.safetensors",
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        if resolved_file is None:
+            raise FileNotFoundError(f"model.safetensors not found in {pretrained_name_or_path}")
+        original_state_dict = load_file(resolved_file)
 
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
-
-            # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
-
-            # Then add "model." prefix for all keys that don't already have it
-            remapped_state_dict = {}
-            remap_count = 0
-
-            for key, value in fixed_state_dict.items():
-                if not key.startswith("model."):
-                    new_key = f"model.{key}"
-                    remapped_state_dict[new_key] = value
-                    remap_count += 1
-                else:
-                    remapped_state_dict[key] = value
-
-            if remap_count > 0:
-                print(f"Remapped {remap_count} state dict keys")
-
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
-
-            if missing_keys:
-                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-                if len(missing_keys) <= 5:
-                    for key in missing_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in missing_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(missing_keys) - 5} more")
-
-            if unexpected_keys:
-                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
-                if len(unexpected_keys) <= 5:
-                    for key in unexpected_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in unexpected_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(unexpected_keys) - 5} more")
-
-            if not missing_keys and not unexpected_keys:
-                print("All keys loaded successfully!")
-
-        except Exception as e:
-            print(f"Warning: Could not load state dict: {e}")
+        # Keep the OpenPI key conversion before adapting only the action layers.
+        fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
+        remapped_state_dict = {
+            key if key.startswith("model.") else f"model.{key}": value
+            for key, value in fixed_state_dict.items()
+        }
+        _expand_pretrained_action_projections(remapped_state_dict, model.state_dict())
+        missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+        if missing_keys or unexpected_keys:
+            logging.warning(
+                "PI0.5 checkpoint load: %d missing and %d unexpected keys",
+                len(missing_keys),
+                len(unexpected_keys),
+            )
 
         return model
 
