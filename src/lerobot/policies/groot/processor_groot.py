@@ -104,6 +104,13 @@ def make_groot_pre_post_processors(
     max_state_dim = config.max_state_dim
     max_action_dim = config.max_action_dim
 
+    image_sizes = [
+        (int(feature.shape[-2]), int(feature.shape[-1]))
+        for feature in config.input_features.values()
+        if feature.type == FeatureType.VISUAL and len(feature.shape) == 3
+    ]
+    video_target_size = min(image_sizes, key=lambda size: size[0] * size[1]) if image_sizes else None
+
     # Pass raw dataset_stats; normalization will occur inside pack step before padding
     padded_stats = dataset_stats or {}
 
@@ -142,6 +149,7 @@ def make_groot_pre_post_processors(
             language_key="task",
             formalize_language=False,
             embodiment_tag=config.embodiment_tag,
+            video_target_size=video_target_size,
             normalize_min_max=True,
             stats=padded_stats,
         ),
@@ -192,6 +200,26 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
     return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
 
 
+def _letterbox_bhwc(images: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
+    """Resize a BHWC uint8 batch without changing its aspect ratio."""
+    target_h, target_w = target_size
+    batch_size, height, width, channels = images.shape
+    if (height, width) == (target_h, target_w):
+        return images
+
+    scale = min(target_h / height, target_w / width)
+    resized_h = max(1, round(height * scale))
+    resized_w = max(1, round(width * scale))
+    top = (target_h - resized_h) // 2
+    left = (target_w - resized_w) // 2
+
+    output = np.zeros((batch_size, target_h, target_w, channels), dtype=np.uint8)
+    for batch_index, image in enumerate(images):
+        resized = Image.fromarray(image).resize((resized_w, resized_h), Image.Resampling.BILINEAR)
+        output[batch_index, top : top + resized_h, left : left + resized_w] = np.asarray(resized)
+    return output
+
+
 def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
     # Validate that the cache directory is ready. If not, instruct the user.
     cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
@@ -225,6 +253,7 @@ class GrootPackInputsStep(ProcessorStep):
     language_key: str = "task"
     formalize_language: bool = False
     embodiment_tag: str = "new_embodiment"
+    video_target_size: tuple[int, int] | None = None
     embodiment_mapping: dict[str, int] = field(
         default_factory=lambda: {
             "new_embodiment": 31,  # Match original GR00T EMBODIMENT_TAG_MAPPING
@@ -280,6 +309,8 @@ class GrootPackInputsStep(ProcessorStep):
             img_keys = [OBS_IMAGE]
         if img_keys:
             cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
+            if self.video_target_size is not None:
+                cams = [_letterbox_bhwc(cam, self.video_target_size) for cam in cams]
             video = np.stack(cams, axis=1)  # (B, V, H, W, C)
             video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C)
             # GR00T validates that video.shape[3] == 3 (channels), so reorder to (B, T, V, C, H, W)
@@ -396,6 +427,7 @@ class GrootPackInputsStep(ProcessorStep):
             "language_key": self.language_key,
             "formalize_language": self.formalize_language,
             "embodiment_tag": self.embodiment_tag,
+            "video_target_size": self.video_target_size,
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
         }

@@ -87,6 +87,18 @@ class EagleBackbone(nn.Module):
             print(f"[GROOT] Warning: failed to prepare Eagle cache for backbone: {exc}")
 
         config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
+        attention_implementation = "sdpa"
+        if use_flash_attention:
+            try:
+                import flash_attn  # noqa: F401
+
+                attention_implementation = "flash_attention_2"
+            except Exception as exc:
+                print(
+                    "[GROOT] FlashAttention2 is unavailable; "
+                    f"using PyTorch SDPA instead ({exc})"
+                )
+        config._attn_implementation = attention_implementation
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
         if project_to_dim is not None:
