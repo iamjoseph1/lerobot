@@ -25,7 +25,7 @@ import torch
 if TYPE_CHECKING:
     from lerobot.datasets import LeRobotDatasetMetadata
 
-from lerobot.configs import FeatureType, PreTrainedConfig
+from lerobot.configs import FeatureType, NormalizationMode, PreTrainedConfig
 from lerobot.envs import EnvConfig, env_to_policy_features
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -283,21 +283,35 @@ def make_pre_post_processors(
     if pretrained_path:
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
-            # GROOT handles normalization in groot_pack_inputs_v3 step
-            # Need to override both stats AND normalize_min_max since saved config might be empty
-            preprocessor_overrides = {}
-            postprocessor_overrides = {}
-            preprocessor_overrides["groot_pack_inputs_v3"] = {
+            # A new fine-tune uses the current dataset statistics and policy modes.
+            # During inference, keep the modes stored in the checkpoint processor.
+            preprocessor_overrides = dict(kwargs.get("preprocessor_overrides", {}))
+            postprocessor_overrides = dict(kwargs.get("postprocessor_overrides", {}))
+            pack_overrides = {
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
             }
-
-            # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats
-            env_action_dim = policy_cfg.output_features[ACTION].shape[0]
-            postprocessor_overrides["groot_action_unpack_unnormalize_v1"] = {
+            unpack_overrides = {
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
+            }
+            if kwargs.get("dataset_stats") is not None:
+                pack_overrides["state_normalization_mode"] = NormalizationMode(
+                    policy_cfg.normalization_mapping["STATE"]
+                ).value
+                pack_overrides["action_normalization_mode"] = NormalizationMode(
+                    policy_cfg.normalization_mapping["ACTION"]
+                ).value
+                unpack_overrides["action_normalization_mode"] = pack_overrides["action_normalization_mode"]
+            preprocessor_overrides["groot_pack_inputs_v3"] = {
+                **pack_overrides,
+                **preprocessor_overrides.get("groot_pack_inputs_v3", {}),
+            }
+            env_action_dim = policy_cfg.output_features[ACTION].shape[0]
+            postprocessor_overrides["groot_action_unpack_unnormalize_v1"] = {
+                **unpack_overrides,
                 "env_action_dim": env_action_dim,
+                **postprocessor_overrides.get("groot_action_unpack_unnormalize_v1", {}),
             }
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides

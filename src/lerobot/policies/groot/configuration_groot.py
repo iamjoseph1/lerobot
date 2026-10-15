@@ -38,12 +38,12 @@ class GrootConfig(PreTrainedConfig):
     # Maximum action dimension. Shorter actions will be zero-padded.
     max_action_dim: int = 32
 
-    # Normalization (start with identity, adjust as needed)
+    # Applied by GrootPackInputsStep and GrootActionUnpackUnnormalizeStep.
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.MEAN_STD,
-            "ACTION": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MIN_MAX,
         }
     )
 

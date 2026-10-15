@@ -33,7 +33,6 @@ else:
 from lerobot.configs import (
     FeatureType,
     NormalizationMode,
-    PolicyFeature,
 )
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -63,6 +62,15 @@ from .configuration_groot import GrootConfig
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
 
 
+def _normalization_mode(mode: str | None, normalize_min_max: bool) -> NormalizationMode:
+    # Older checkpoints only store normalize_min_max.
+    selected = mode if mode is not None else ("MIN_MAX" if normalize_min_max else "IDENTITY")
+    selected = NormalizationMode(selected)
+    if selected not in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILES, NormalizationMode.IDENTITY):
+        raise ValueError(f"Unsupported GR00T normalization mode: {selected}")
+    return selected
+
+
 def make_groot_pre_post_processors(
     config: GrootConfig, dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None
 ) -> tuple[
@@ -77,18 +85,16 @@ def make_groot_pre_post_processors(
     Preprocessing steps:
     1. Optional key renaming (dataset-specific key mapping)
     2. Add batch dimension to unbatched data
-    3. Pack video/state/action/language/embodiment and apply optional min-max normalization before padding
+    3. Pack video/state/action/language/embodiment and normalize before padding
     4. Encode video+language with Eagle VLM into intermediate eagle_content
     5. Collate eagle_content into batched eagle_* tensors
     6. Move tensors to device (GPU)
 
-    NOTE: We optionally apply min-max normalization to STATE and ACTION using
-    dataset-provided statistics prior to padding, mapping values to [-1, 1].
-    This mirrors SO100-style preprocessing and keeps scales consistent with GR00T.
+    STATE and ACTION use the normalization modes in config.normalization_mapping.
 
     Args:
         config: Groot configuration containing data_config, embodiment_tag, etc.
-        dataset_stats: Optional per-key min/max statistics for normalization before padding.
+        dataset_stats: Optional per-key statistics for normalization before padding.
 
     Returns:
         Tuple of (preprocessor, postprocessor) pipelines
@@ -114,21 +120,10 @@ def make_groot_pre_post_processors(
     # Pass raw dataset_stats; normalization will occur inside pack step before padding
     padded_stats = dataset_stats or {}
 
-    # Define feature specs for optional normalization steps
-    _features: dict[str, PolicyFeature] = {
-        # Observation features (only add those we may normalize)
-        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(state_horizon, max_state_dim)),
-        # Action feature
-        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(action_horizon, max_action_dim)),
-    }
+    state_mode = _normalization_mode(config.normalization_mapping["STATE"], True)
+    action_mode = _normalization_mode(config.normalization_mapping["ACTION"], True)
 
-    # Normalize STATE and ACTION with min_max (SO100-like default)
-    _norm_map = {
-        FeatureType.ACTION: NormalizationMode.MIN_MAX,
-        FeatureType.STATE: NormalizationMode.MIN_MAX,
-    }
-
-    # Determine env action dimension from config (simple, object-like PolicyFeature)
+    # Determine env action dimension from config.
     try:
         env_action_dim = int(config.output_features[ACTION].shape[0])
     except Exception:
@@ -140,7 +135,7 @@ def make_groot_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),
         # 2. Add batch dimension for single samples
         AddBatchDimensionProcessorStep(),
-        # 3. Pack video/state/action/language/embodiment; apply optional min-max normalization before padding
+        # 3. Pack video/state/action/language/embodiment; normalize before padding
         GrootPackInputsStep(
             state_horizon=state_horizon,
             action_horizon=action_horizon,
@@ -151,6 +146,8 @@ def make_groot_pre_post_processors(
             embodiment_tag=config.embodiment_tag,
             video_target_size=video_target_size,
             normalize_min_max=True,
+            state_normalization_mode=state_mode.value,
+            action_normalization_mode=action_mode.value,
             stats=padded_stats,
         ),
         # 4. Eagle encode (creates eagle_content)
@@ -171,6 +168,7 @@ def make_groot_pre_post_processors(
             env_action_dim=env_action_dim,
             stats=padded_stats,
             normalize_min_max=True,
+            action_normalization_mode=action_mode.value,
         ),
         # Finally, move to CPU for env interaction
         DeviceProcessorStep(device="cpu"),
@@ -264,8 +262,10 @@ class GrootPackInputsStep(ProcessorStep):
             "unitree_g1": 3,
         }
     )
-    # Min-max normalization (SO100-like) applied BEFORE padding
+    # normalize_min_max is retained for checkpoints saved before normalization modes were configurable.
     normalize_min_max: bool = True
+    state_normalization_mode: str | None = None
+    action_normalization_mode: str | None = None
     stats: dict[str, dict[str, Any]] | None = None
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -288,15 +288,23 @@ class GrootPackInputsStep(ProcessorStep):
                 return torch.cat([t, pad], dim=0)
             return t[:target_dim]
 
-        def _min_max_norm(x: torch.Tensor, key: str) -> torch.Tensor:
-            if not self.normalize_min_max:
+        def _normalize(x: torch.Tensor, key: str, mode: str | None) -> torch.Tensor:
+            selected = _normalization_mode(mode, self.normalize_min_max)
+            if selected == NormalizationMode.IDENTITY:
                 return x
             if self.stats is None or key not in self.stats:
+                if selected == NormalizationMode.QUANTILES:
+                    raise ValueError(f"QUANTILES normalization requires stats for {key}")
                 return x
             stats_k = self.stats[key]
             last_dim = x.shape[-1]
-            min_v = _align_vec(stats_k.get("min", torch.zeros(last_dim)), last_dim, default=0.0)
-            max_v = _align_vec(stats_k.get("max", torch.ones(last_dim)), last_dim, default=1.0)
+            low_key, high_key = (
+                ("q01", "q99") if selected == NormalizationMode.QUANTILES else ("min", "max")
+            )
+            if selected == NormalizationMode.QUANTILES and (low_key not in stats_k or high_key not in stats_k):
+                raise ValueError(f"QUANTILES normalization requires {low_key}/{high_key} stats for {key}")
+            min_v = _align_vec(stats_k.get(low_key, torch.zeros(last_dim)), last_dim, default=0.0)
+            max_v = _align_vec(stats_k.get(high_key, torch.ones(last_dim)), last_dim, default=1.0)
             denom = max_v - min_v
             mask = denom != 0
             safe_denom = torch.where(mask, denom, torch.ones_like(denom))
@@ -338,8 +346,7 @@ class GrootPackInputsStep(ProcessorStep):
                 raise ValueError(f"state must be (B, D), got {tuple(state.shape)}")
             bsz, d = state.shape
             # Normalize BEFORE padding
-            if self.normalize_min_max:
-                state = _min_max_norm(state, OBS_STATE)
+            state = _normalize(state, OBS_STATE, self.state_normalization_mode)
             state = state.unsqueeze(1)  # (B, 1, D)
             if d > self.max_state_dim:
                 state = state[:, :, : self.max_state_dim]
@@ -356,14 +363,8 @@ class GrootPackInputsStep(ProcessorStep):
         action = transition.get(TransitionKey.ACTION)
         if isinstance(action, torch.Tensor):
             # Normalize BEFORE temporal expansion/padding
-            if self.normalize_min_max:
-                if action.dim() == 2:
-                    action = _min_max_norm(action, ACTION)
-                elif action.dim() == 3:
-                    b, t, d = action.shape
-                    flat = action.reshape(b * t, d)
-                    flat = _min_max_norm(flat, ACTION)
-                    action = flat.view(b, t, d)
+            if action.dim() in (2, 3):
+                action = _normalize(action, ACTION, self.action_normalization_mode)
             if action.dim() == 2:
                 action = action.unsqueeze(1).repeat(1, self.action_horizon, 1)
             elif action.dim() == 3:
@@ -430,6 +431,8 @@ class GrootPackInputsStep(ProcessorStep):
             "video_target_size": self.video_target_size,
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
+            "state_normalization_mode": self.state_normalization_mode,
+            "action_normalization_mode": self.action_normalization_mode,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
@@ -608,8 +611,9 @@ class GrootEagleCollateStep(ProcessorStep):
 @ProcessorStepRegistry.register(name="groot_action_unpack_unnormalize_v1")
 class GrootActionUnpackUnnormalizeStep(ProcessorStep):
     env_action_dim: int = 0
-    # Apply inverse of min-max normalization if it was used in preprocessor
+    # Retained for checkpoints saved before normalization modes were configurable.
     normalize_min_max: bool = True
+    action_normalization_mode: str | None = None
     stats: dict[str, dict[str, Any]] | None = None
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -625,17 +629,22 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         if self.env_action_dim and action.shape[-1] >= self.env_action_dim:
             action = action[..., : self.env_action_dim]
 
-        # Inverse min-max normalization mirroring _min_max_norm:
-        # forward: y = 2 * (x - min) / denom - 1, with y=0 when denom==0
-        # inverse: x = (y+1)/2 * denom + min, and when denom==0 -> x = min
-        if self.normalize_min_max and self.stats is not None:
-            stats_k = self.stats.get(ACTION, {})
+        mode = _normalization_mode(self.action_normalization_mode, self.normalize_min_max)
+        if mode != NormalizationMode.IDENTITY and (
+            self.stats is not None or mode == NormalizationMode.QUANTILES
+        ):
+            stats_k = (self.stats or {}).get(ACTION, {})
+            low_key, high_key = (
+                ("q01", "q99") if mode == NormalizationMode.QUANTILES else ("min", "max")
+            )
+            if mode == NormalizationMode.QUANTILES and (low_key not in stats_k or high_key not in stats_k):
+                raise ValueError(f"QUANTILES unnormalization requires {low_key}/{high_key} stats for {ACTION}")
             d = action.shape[-1]
             min_v = torch.as_tensor(
-                stats_k.get("min", torch.zeros(d)), dtype=action.dtype, device=action.device
+                stats_k.get(low_key, torch.zeros(d)), dtype=action.dtype, device=action.device
             )
             max_v = torch.as_tensor(
-                stats_k.get("max", torch.ones(d)), dtype=action.dtype, device=action.device
+                stats_k.get(high_key, torch.ones(d)), dtype=action.dtype, device=action.device
             )
             if min_v.numel() != d:
                 min_v = torch.nn.functional.pad(min_v.flatten()[:d], (0, max(0, d - min_v.numel())))
@@ -664,6 +673,7 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         return {
             "env_action_dim": self.env_action_dim,
             "normalize_min_max": self.normalize_min_max,
+            "action_normalization_mode": self.action_normalization_mode,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
