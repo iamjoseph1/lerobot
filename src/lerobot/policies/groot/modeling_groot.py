@@ -60,6 +60,16 @@ def _replace_parameter(
     setattr(module, name, torch.nn.Parameter(value, requires_grad=requires_grad))
 
 
+def _small_random_extension(pretrained: Tensor, shape: tuple[int, ...]) -> Tensor:
+    """Sample new channels at 10% of each embodiment's pretrained mean and std."""
+    values = pretrained.detach().float()
+    reduce_dims = tuple(range(1, values.ndim))
+    mean = values.mean(dim=reduce_dims, keepdim=True)
+    std = values.std(dim=reduce_dims, keepdim=True, unbiased=False).clamp_min(1e-6)
+    noise = torch.randn(shape, device=pretrained.device, dtype=torch.float32)
+    return (0.1 * (mean + std * noise)).to(dtype=pretrained.dtype)
+
+
 def adapt_groot_io_dimensions(
     model: GR00TN15, max_state_dim: int, max_action_dim: int
 ) -> None:
@@ -67,8 +77,8 @@ def adapt_groot_io_dimensions(
 
     GR00T-N1.5 is released with a 64D state encoder and 32D action encoder/decoder. Wider robot
     vectors must be adapted after the base checkpoint has loaded; constructing a wider head first
-    would cause shape-mismatch loading. New channels start at zero, so the original pretrained
-    behavior is unchanged until fine-tuning supplies gradients for them.
+    would cause shape-mismatch loading. New channels receive small random weights sampled from
+    each embodiment's pretrained weight distribution; existing channels are preserved exactly.
     """
     head = model.action_head
     old_state_dim = int(head.state_encoder.layer1.W.shape[1])
@@ -83,30 +93,50 @@ def adapt_groot_io_dimensions(
     if max_state_dim > old_state_dim:
         layer = head.state_encoder.layer1
         trainable = layer.W.requires_grad
-        expanded = layer.W.detach().new_zeros(
-            layer.W.shape[0], max_state_dim, layer.W.shape[2]
+        expanded = torch.cat(
+            (
+                layer.W.detach(),
+                _small_random_extension(
+                    layer.W, (layer.W.shape[0], max_state_dim - old_state_dim, layer.W.shape[2])
+                ),
+            ),
+            dim=1,
         )
-        expanded[:, :old_state_dim, :] = layer.W.detach()
         _replace_parameter(layer, "W", expanded, requires_grad=trainable)
 
     if max_action_dim > old_action_dim:
         encoder = head.action_encoder.W1
         trainable = encoder.W.requires_grad
-        expanded = encoder.W.detach().new_zeros(
-            encoder.W.shape[0], max_action_dim, encoder.W.shape[2]
+        expanded = torch.cat(
+            (
+                encoder.W.detach(),
+                _small_random_extension(
+                    encoder.W, (encoder.W.shape[0], max_action_dim - old_action_dim, encoder.W.shape[2])
+                ),
+            ),
+            dim=1,
         )
-        expanded[:, :old_action_dim, :] = encoder.W.detach()
         _replace_parameter(encoder, "W", expanded, requires_grad=trainable)
 
         decoder = head.action_decoder.layer2
         weight_trainable = decoder.W.requires_grad
         bias_trainable = decoder.b.requires_grad
-        expanded_w = decoder.W.detach().new_zeros(
-            decoder.W.shape[0], decoder.W.shape[1], max_action_dim
+        expanded_w = torch.cat(
+            (
+                decoder.W.detach(),
+                _small_random_extension(
+                    decoder.W, (decoder.W.shape[0], decoder.W.shape[1], max_action_dim - old_action_dim)
+                ),
+            ),
+            dim=2,
         )
-        expanded_b = decoder.b.detach().new_zeros(decoder.b.shape[0], max_action_dim)
-        expanded_w[:, :, :old_action_dim] = decoder.W.detach()
-        expanded_b[:, :old_action_dim] = decoder.b.detach()
+        expanded_b = torch.cat(
+            (
+                decoder.b.detach(),
+                _small_random_extension(decoder.b, (decoder.b.shape[0], max_action_dim - old_action_dim)),
+            ),
+            dim=1,
+        )
         _replace_parameter(decoder, "W", expanded_w, requires_grad=weight_trainable)
         _replace_parameter(decoder, "b", expanded_b, requires_grad=bias_trainable)
 
@@ -122,7 +152,7 @@ def adapt_groot_io_dimensions(
         print(
             "[GROOT] expanded pretrained action head "
             f"state {old_state_dim}->{max_state_dim}, action {old_action_dim}->{max_action_dim}; "
-            "new channels are zero-initialized"
+            "new channels use small random initialization from pretrained statistics"
         )
 
 
